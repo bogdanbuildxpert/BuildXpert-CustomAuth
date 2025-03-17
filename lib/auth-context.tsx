@@ -6,43 +6,99 @@ import React, {
   useState,
   useEffect,
   useRef,
+  useCallback,
 } from "react";
-import { useSession, signIn, signOut } from "next-auth/react";
 import { toast } from "sonner";
-
-interface User {
-  id: string;
-  name: string | null;
-  email: string;
-  role: string;
-}
-
-interface AuthContextType {
-  user: User | null;
-  isLoading: boolean;
-  login: (user: User) => void;
-  logout: () => void;
-  resetInactivityTimer: () => void;
-}
+import { useRouter } from "next/navigation";
+import axios from "axios";
 
 // 5 hours in milliseconds
 const INACTIVITY_TIMEOUT = 5 * 60 * 60 * 1000;
 // Warning 5 minutes before logout
 const WARNING_BEFORE_TIMEOUT = 5 * 60 * 1000;
 
+// Define our custom User type to replace Supabase's User
+export interface User {
+  id: string;
+  email: string;
+  role: string;
+  user_metadata?: Record<string, any>;
+  app_metadata?: Record<string, any>;
+}
+
+interface AuthContextType {
+  user: User | null;
+  isLoading: boolean;
+  signIn: (email: string, password: string) => Promise<void>;
+  signUp: (
+    email: string,
+    password: string,
+    metadata: { name: string; role?: string }
+  ) => Promise<void>;
+  signOut: () => Promise<void>;
+  signInWithGoogle: () => Promise<void>;
+  resetInactivityTimer: () => void;
+}
+
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
+export function useAuth() {
+  const context = useContext(AuthContext);
+  if (context === undefined) {
+    throw new Error("useAuth must be used within an AuthProvider");
+  }
+  return context;
+}
+
+// Helper function to check if a user is an admin
+export function isUserAdmin(user: User | null): boolean {
+  if (!user) return false;
+
+  // Check role directly
+  if (user.role === "ADMIN" || user.role === "admin") {
+    return true;
+  }
+
+  // Check in user_metadata
+  const metadataRole = user.user_metadata?.role;
+  if (metadataRole === "ADMIN" || metadataRole === "admin") {
+    return true;
+  }
+
+  // Check in app_metadata.roles array (RBAC system)
+  const appMetadataRoles = user.app_metadata?.roles;
+  if (Array.isArray(appMetadataRoles) && appMetadataRoles.includes("admin")) {
+    return true;
+  }
+
+  // Special case for specific email (for development/testing)
+  if (user.email === "bogdanhutuleac@outlook.com") {
+    return true;
+  }
+
+  return false;
+}
+
+// Create an axios instance with credentials
+const api = axios.create({
+  baseURL: "/api",
+  withCredentials: true,
+  headers: {
+    "Content-Type": "application/json",
+  },
+});
+
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const { data: session, status } = useSession();
   const [user, setUser] = useState<User | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const router = useRouter();
   const inactivityTimerRef = useRef<NodeJS.Timeout | null>(null);
   const warningTimerRef = useRef<NodeJS.Timeout | null>(null);
   const lastActivityRef = useRef<number>(Date.now());
   const warningShownRef = useRef<boolean>(false);
 
   // Function to reset the inactivity timer
-  const resetInactivityTimer = () => {
+  const resetInactivityTimer = useCallback(() => {
     // Clear existing timers
     if (inactivityTimerRef.current) {
       clearTimeout(inactivityTimerRef.current);
@@ -82,11 +138,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           toast.info("You've been logged out due to inactivity", {
             duration: 5000,
           });
-          logout();
+          signOut();
         }
       }, INACTIVITY_TIMEOUT);
     }
-  };
+  }, [user]);
 
   // Set up event listeners for user activity
   useEffect(() => {
@@ -117,84 +173,132 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         clearTimeout(warningTimerRef.current);
       }
     };
-  }, [user]); // Re-run when user changes
+  }, [resetInactivityTimer]);
 
   useEffect(() => {
-    // Check if user is stored in localStorage as a fallback
-    const storedUser = localStorage.getItem("user");
-    if (storedUser && !session) {
+    // Get initial session
+    const getInitialSession = async () => {
       try {
-        setUser(JSON.parse(storedUser));
+        console.log("Getting initial session...");
+
+        try {
+          const response = await api.get("/auth/user");
+          console.log("Session found:", response.data);
+          setUser(response.data.user);
+        } catch (error) {
+          console.log("No active session:", error);
+          setUser(null);
+        }
+
+        setIsLoading(false);
       } catch (error) {
-        console.error("Failed to parse user from localStorage:", error);
-        localStorage.removeItem("user");
+        console.error("Unexpected error getting session:", error);
+        setUser(null);
+        setIsLoading(false);
       }
+    };
+
+    getInitialSession();
+  }, []);
+
+  // Sign in with email and password
+  const signIn = async (email: string, password: string) => {
+    try {
+      setIsLoading(true);
+      const response = await api.post("/auth/login", { email, password });
+
+      if (response.data.user) {
+        setUser(response.data.user);
+        toast.success("Signed in successfully");
+        router.push("/dashboard");
+      } else {
+        toast.error("Failed to sign in");
+      }
+    } catch (error: any) {
+      console.error("Error signing in:", error);
+      toast.error(error.response?.data?.error || "Failed to sign in");
+    } finally {
+      setIsLoading(false);
     }
-
-    // If we have a session from NextAuth, use that
-    if (session && session.user) {
-      const nextAuthUser = {
-        id: session.user.id as string,
-        name: session.user.name || null,
-        email: session.user.email as string,
-        role: (session.user as any).role || "CLIENT",
-      };
-      setUser(nextAuthUser);
-
-      // Also update localStorage for backward compatibility
-      localStorage.setItem("user", JSON.stringify(nextAuthUser));
-    }
-
-    setIsLoading(status === "loading");
-  }, [session, status]);
-
-  const login = (userData: User) => {
-    setUser(userData);
-    localStorage.setItem("user", JSON.stringify(userData));
-
-    // Also set the user in a cookie for server-side access
-    document.cookie = `user=${JSON.stringify(userData)}; path=/; max-age=${
-      60 * 60 * 24 * 7
-    }`; // 7 days
-
-    // Reset inactivity timer on login
-    resetInactivityTimer();
   };
 
-  const logout = () => {
-    setUser(null);
-    localStorage.removeItem("user");
+  // Sign up with email and password
+  const signUp = async (
+    email: string,
+    password: string,
+    metadata: { name: string; role?: string }
+  ) => {
+    try {
+      setIsLoading(true);
+      const response = await api.post("/auth/register", {
+        email,
+        password,
+        name: metadata.name,
+        role: metadata.role || "CLIENT",
+      });
 
-    // Also clear the user cookie
-    document.cookie = "user=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT";
-
-    // Sign out from NextAuth
-    signOut({ redirect: false });
-
-    // Clear inactivity timer
-    if (inactivityTimerRef.current) {
-      clearTimeout(inactivityTimerRef.current);
-      inactivityTimerRef.current = null;
+      if (response.data.user) {
+        setUser(response.data.user);
+        toast.success("Signed up successfully");
+        router.push("/dashboard");
+      } else {
+        toast.error("Failed to sign up");
+      }
+    } catch (error: any) {
+      console.error("Error signing up:", error);
+      toast.error(error.response?.data?.error || "Failed to sign up");
+    } finally {
+      setIsLoading(false);
     }
-    if (warningTimerRef.current) {
-      clearTimeout(warningTimerRef.current);
-      warningTimerRef.current = null;
+  };
+
+  // Sign in with Google
+  const signInWithGoogle = async () => {
+    try {
+      // Store the redirect URL in localStorage
+      const redirectUrl = localStorage.getItem("redirectTo") || "/dashboard";
+
+      // Redirect to the Google OAuth endpoint
+      window.location.href = `/api/auth/google?redirectUrl=${encodeURIComponent(
+        redirectUrl
+      )}`;
+    } catch (error: any) {
+      console.error("Error signing in with Google:", error);
+      toast.error("Failed to sign in with Google");
+    }
+  };
+
+  // Sign out
+  const signOut = async () => {
+    try {
+      setIsLoading(true);
+      await api.post("/auth/logout");
+      setUser(null);
+      toast.success("Signed out successfully");
+      router.push("/login");
+    } catch (error) {
+      console.error("Error signing out:", error);
+      // Even if the API call fails, we should still clear the user state
+      setUser(null);
+      router.push("/login");
+    } finally {
+      setIsLoading(false);
     }
   };
 
   return (
     <AuthContext.Provider
-      value={{ user, isLoading, login, logout, resetInactivityTimer }}
+      value={{
+        user,
+        isLoading,
+        signIn,
+        signUp,
+        signOut,
+        signInWithGoogle,
+        resetInactivityTimer,
+      }}
     >
       {children}
     </AuthContext.Provider>
   );
-}
-
-export function useAuth() {
-  const context = useContext(AuthContext);
-  if (context === undefined) {
-    throw new Error("useAuth must be used within an AuthProvider");
-  }
-  return context;
 }

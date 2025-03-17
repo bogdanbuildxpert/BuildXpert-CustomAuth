@@ -32,6 +32,19 @@ const nextConfig = {
     parallelServerBuildTraces: true,
     parallelServerCompiles: true,
   },
+  // Add rewrites to proxy API requests to our custom server
+  async rewrites() {
+    return [
+      {
+        source: "/api/:path*",
+        destination: "http://localhost:3001/api/:path*",
+      },
+      {
+        source: "/socket.io/:path*",
+        destination: "http://localhost:3001/socket.io/:path*",
+      },
+    ];
+  },
 };
 
 mergeConfig(nextConfig, userConfig);
